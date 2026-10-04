@@ -23,7 +23,7 @@ DEFAULT_REGION = os.getenv("DEFAULT_REGION", "us-central1")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "gc-run-service")
 CONTAINER_IMAGE = os.getenv("CONTAINER_IMAGE")
 
-PORT = int(os.getenv("PORT", "8080"))
+PORT = 8081
 
 URL_RE = re.compile(r"https?://\S+", re.I)
 
