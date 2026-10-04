@@ -1,9 +1,9 @@
 import os
 import re
+import json
 import asyncio
+
 from urllib.parse import urlparse, parse_qs, unquote
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from threading import Thread
 
 from telegram import Update
 from telegram.ext import (
@@ -16,67 +16,119 @@ from telegram.ext import (
 
 from google.cloud import run_v2
 from google.api_core.exceptions import GoogleAPICallError
+from google.oauth2 import service_account
+import google.auth
 
 
 TOKEN = os.getenv("BOT_TOKEN")
-DEFAULT_REGION = os.getenv("DEFAULT_REGION", "us-central1")
-SERVICE_NAME = os.getenv("SERVICE_NAME", "gc-run-service")
-CONTAINER_IMAGE = os.getenv("CONTAINER_IMAGE")
 
-PORT = 8081
+DEFAULT_REGION = os.getenv(
+    "DEFAULT_REGION",
+    "us-central1"
+)
 
-URL_RE = re.compile(r"https?://\S+", re.I)
+SERVICE_NAME = os.getenv(
+    "SERVICE_NAME",
+    "gc-run-service"
+)
+
+CONTAINER_IMAGE = os.getenv(
+    "CONTAINER_IMAGE"
+)
+
+# اسم المتغير السري الذي سنستخدمه لاحقًا في Blitz
+GOOGLE_CREDENTIALS_JSON = os.getenv(
+    "GOOGLE_CREDENTIALS_JSON"
+)
+
+
+URL_RE = re.compile(
+    r"https?://\S+",
+    re.I
+)
 
 
 # =========================================================
-# HTTP HEALTH SERVER - Cloud Run
+# GOOGLE CREDENTIALS
 # =========================================================
 
-class HealthHandler(BaseHTTPRequestHandler):
+def get_google_credentials():
 
-    def do_GET(self):
-        if self.path in ("/", "/health", "/healthz"):
-            body = b"OK"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        else:
-            body = b"Not Found"
-            self.send_response(404)
-            self.send_header("Content-Type", "text/plain")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+    # إذا وُجد JSON في متغير Blitz السري
+    if GOOGLE_CREDENTIALS_JSON:
 
-    def log_message(self, format, *args):
-        return
+        try:
+            info = json.loads(
+                GOOGLE_CREDENTIALS_JSON
+            )
 
+            credentials = (
+                service_account
+                .Credentials
+                .from_service_account_info(
+                    info,
+                    scopes=[
+                        "https://www.googleapis.com/auth/cloud-platform"
+                    ],
+                )
+            )
 
-def start_health_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    print(f"HTTP health server listening on 0.0.0.0:{PORT}")
-    server.serve_forever()
+            return credentials
+
+        except Exception as exc:
+
+            raise RuntimeError(
+                "GOOGLE_CREDENTIALS_JSON غير صالح: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    # محاولة استخدام ADC
+    try:
+
+        credentials, _ = google.auth.default()
+
+        return credentials
+
+    except Exception as exc:
+
+        raise RuntimeError(
+            "لم يتم العثور على Google Cloud credentials.\n"
+            "أضف GOOGLE_CREDENTIALS_JSON في Blitz "
+            "أو اربط Service Account بالتطبيق.\n\n"
+            f"{type(exc).__name__}: {exc}"
+        )
 
 
 # =========================================================
 # PROJECT ID
 # =========================================================
 
-def extract_project_id(text: str) -> str | None:
+def extract_project_id(
+    text: str
+) -> str | None:
+
     candidates = [text]
 
     for m in URL_RE.findall(text):
         candidates.append(m)
 
     for value in candidates:
-        decoded = unquote(value)
-        parsed = urlparse(decoded)
-        query = parse_qs(parsed.query)
 
-        for key in ("project", "project_id"):
+        decoded = unquote(value)
+
+        parsed = urlparse(decoded)
+
+        query = parse_qs(
+            parsed.query
+        )
+
+        for key in (
+            "project",
+            "project_id",
+        ):
+
             if key in query and query[key]:
+
                 project = query[key][0].strip()
 
                 if re.fullmatch(
@@ -109,70 +161,92 @@ def extract_project_id(text: str) -> str | None:
 # CLOUD RUN
 # =========================================================
 
-def service_url(service: run_v2.Service) -> str:
+def service_url(
+    service: run_v2.Service
+) -> str:
+
     if service.uri:
         return service.uri
 
     return "(لم يتم إرجاع رابط الخدمة)"
 
 
-async def deploy_cloud_run(project_id: str) -> tuple[bool, str]:
+async def deploy_cloud_run(
+    project_id: str
+) -> tuple[bool, str]:
 
     if not CONTAINER_IMAGE:
+
         return (
             False,
-            "لم يتم ضبط CONTAINER_IMAGE في متغيرات البيئة."
+            "لم يتم ضبط CONTAINER_IMAGE في Blitz."
         )
-
-    client = run_v2.ServicesAsyncClient()
-
-    parent = (
-        f"projects/{project_id}/locations/{DEFAULT_REGION}"
-    )
-
-    name = f"{parent}/services/{SERVICE_NAME}"
-
-    container = run_v2.types.Container(
-        image=CONTAINER_IMAGE
-    )
-
-    template = run_v2.types.RevisionTemplate(
-        containers=[container]
-    )
-
-    service = run_v2.types.Service(
-        name=name,
-        template=template,
-        ingress=(
-            run_v2.types.Service.IngressTraffic
-            .INGRESS_TRAFFIC_ALL
-        ),
-    )
 
     try:
 
+        credentials = get_google_credentials()
+
+        client = run_v2.ServicesAsyncClient(
+            credentials=credentials
+        )
+
+        parent = (
+            f"projects/{project_id}"
+            f"/locations/{DEFAULT_REGION}"
+        )
+
+        name = (
+            f"{parent}"
+            f"/services/{SERVICE_NAME}"
+        )
+
+        container = run_v2.types.Container(
+            image=CONTAINER_IMAGE
+        )
+
+        template = run_v2.types.RevisionTemplate(
+            containers=[container]
+        )
+
+        service = run_v2.types.Service(
+            name=name,
+            template=template,
+            ingress=(
+                run_v2.types.Service.IngressTraffic
+                .INGRESS_TRAFFIC_ALL
+            ),
+        )
+
         try:
+
             existing = await client.get_service(
                 name=name
             )
 
             service.name = existing.name
 
-            operation = await client.update_service(
-                service=service
+            operation = (
+                await client.update_service(
+                    service=service
+                )
             )
 
         except GoogleAPICallError:
 
-            operation = await client.create_service(
-                parent=parent,
-                service=service,
-                service_id=SERVICE_NAME,
+            operation = (
+                await client.create_service(
+                    parent=parent,
+                    service=service,
+                    service_id=SERVICE_NAME,
+                )
             )
 
         result = await operation.result()
 
-        return True, service_url(result)
+        return (
+            True,
+            service_url(result)
+        )
 
     except Exception as exc:
 
@@ -183,7 +257,7 @@ async def deploy_cloud_run(project_id: str) -> tuple[bool, str]:
 
 
 # =========================================================
-# /START
+# START
 # =========================================================
 
 async def start(
@@ -193,27 +267,23 @@ async def start(
 
     text = (
         "👋 أهلاً بك في GC.Run\n\n"
-
         "☁️ Google Cloud → Cloud Run\n\n"
-
         "📎 أرسل رابط Google Cloud/Skills "
         "الذي يحتوي على Project ID.\n\n"
-
-        "🔐 لا ترسل كلمة مرور Google أو رموز SSO.\n"
-
-        "🎯 البوت يستخدم حساب الخدمة "
-        "المصرّح له بالنشر.\n\n"
-
+        "🔐 لا ترسل كلمة مرور Google "
+        "أو رموز SSO.\n\n"
         "/help — طريقة الاستخدام\n"
         "/cancel — إلغاء العملية\n"
         "/status — حالة الإعداد"
     )
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text
+    )
 
 
 # =========================================================
-# /HELP
+# HELP
 # =========================================================
 
 async def help_cmd(
@@ -223,27 +293,23 @@ async def help_cmd(
 
     text = (
         "📖 طريقة الاستخدام:\n\n"
-
         "1️⃣ اضغط /start\n"
-
         "2️⃣ أرسل رابط Google Cloud "
         "الذي يحتوي على project=...\n"
-
         "3️⃣ البوت يستخرج Project ID\n"
-
         "4️⃣ ينشئ أو يحدّث خدمة Cloud Run\n"
-
         "5️⃣ يرسل رابط الخدمة\n\n"
-
-        "⚠️ لا ترسل كلمات المرور أو "
-        "رموز تسجيل الدخول."
+        "⚠️ لا ترسل كلمات المرور "
+        "أو رموز تسجيل الدخول."
     )
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        text
+    )
 
 
 # =========================================================
-# /CANCEL
+# CANCEL
 # =========================================================
 
 async def cancel(
@@ -259,7 +325,7 @@ async def cancel(
 
 
 # =========================================================
-# /STATUS
+# STATUS
 # =========================================================
 
 async def status(
@@ -267,7 +333,9 @@ async def status(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    project = context.user_data.get("project_id")
+    project = context.user_data.get(
+        "project_id"
+    )
 
     if project:
 
@@ -285,7 +353,7 @@ async def status(
 
 
 # =========================================================
-# MESSAGE HANDLER
+# MESSAGE
 # =========================================================
 
 async def handle_message(
@@ -307,19 +375,26 @@ async def handle_message(
 
         await update.message.reply_text(
             "❌ لم أجد Project ID في الرابط.\n\n"
-            "أرسل رابط Google Cloud يحتوي على "
-            "project=..."
+            "أرسل رابط Google Cloud يحتوي "
+            "على project=..."
         )
 
         return
 
-    context.user_data["project_id"] = project_id
-    context.user_data["cancelled"] = False
+    context.user_data[
+        "project_id"
+    ] = project_id
 
-    progress = await update.message.reply_text(
-        "☁️ GC.Run\n\n"
-        "✅ تم استلام الرابط.\n"
-        "🔎 جاري استخراج Project ID..."
+    context.user_data[
+        "cancelled"
+    ] = False
+
+    progress = (
+        await update.message.reply_text(
+            "☁️ GC.Run\n\n"
+            "✅ تم استلام الرابط.\n"
+            "🔎 جاري استخراج Project ID..."
+        )
     )
 
     steps = [
@@ -331,14 +406,18 @@ async def handle_message(
 
     for index, step in enumerate(steps):
 
-        if context.user_data.get("cancelled"):
+        if context.user_data.get(
+            "cancelled"
+        ):
             return
 
         await asyncio.sleep(0.5)
 
         await progress.edit_text(
             "☁️ GC.Run\n\n"
-            + "\n".join(steps[:index + 1])
+            + "\n".join(
+                steps[:index + 1]
+            )
         )
 
     ok, result = await deploy_cloud_run(
@@ -359,8 +438,8 @@ async def handle_message(
         await progress.edit_text(
             "❌ فشل النشر.\n\n"
             f"السبب:\n{result}\n\n"
-            "تحقق من صلاحيات حساب الخدمة "
-            "واسم صورة الحاوية."
+            "تحقق من Google Cloud credentials "
+            "وصلاحيات الحساب واسم صورة الحاوية."
         )
 
 
@@ -371,19 +450,11 @@ async def handle_message(
 def main():
 
     if not TOKEN:
+
         raise RuntimeError(
-            "BOT_TOKEN غير مضبوط."
+            "BOT_TOKEN غير مضبوط في Blitz."
         )
 
-    # تشغيل HTTP health server
-    health_thread = Thread(
-        target=start_health_server,
-        daemon=True
-    )
-
-    health_thread.start()
-
-    # تشغيل Telegram bot
     app = (
         Application
         .builder()
@@ -392,29 +463,44 @@ def main():
     )
 
     app.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
     app.add_handler(
-        CommandHandler("help", help_cmd)
+        CommandHandler(
+            "help",
+            help_cmd
+        )
     )
 
     app.add_handler(
-        CommandHandler("cancel", cancel)
+        CommandHandler(
+            "cancel",
+            cancel
+        )
     )
 
     app.add_handler(
-        CommandHandler("status", status)
+        CommandHandler(
+            "status",
+            status
+        )
     )
 
     app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            filters.TEXT
+            & ~filters.COMMAND,
             handle_message
         )
     )
 
-    print("GC.Run bot started")
+    print(
+        "GC.Run bot started"
+    )
 
     app.run_polling()
 
