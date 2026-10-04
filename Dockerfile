@@ -20,6 +20,6 @@ COPY config.json /etc/xray/config.json
 
 ENV PYTHONUNBUFFERED=1
 
-EXPOSE 8080
+EXPOSE 8081
 
 CMD ["sh", "-c", "/usr/local/bin/xray/xray run -config /etc/xray/config.json & exec python bot.py"]
