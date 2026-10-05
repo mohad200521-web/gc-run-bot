@@ -211,9 +211,7 @@ async def deploy_cloud_run(
         service = run_v2.types.Service(
             name=name,
             template=template,
-            ingress=(
-                run_v2.types.Service.IngressTraffic
-                .INGRESS_TRAFFIC_ALL
+            
             ),
         )
 
