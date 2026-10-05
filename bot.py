@@ -208,11 +208,10 @@ async def deploy_cloud_run(
             containers=[container]
         )
 
-        service = run_v2.types.Service(
+                service = run_v2.types.Service(
             name=name,
             template=template,
-            
-            ),
+        )
         
 
         try:
