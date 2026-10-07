@@ -12,8 +12,10 @@ RUN curl -L -o /tmp/xray.zip \
     && chmod +x /usr/local/bin/xray/xray \
     && rm /tmp/xray.zip
 
-COPY config.json /etc/xray/config.json
+COPY entrypoint.sh /app/entrypoint.sh
+
+RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 8080
 
-CMD ["/usr/local/bin/xray/xray", "run", "-config", "/etc/xray/config.json"]
+CMD ["/app/entrypoint.sh"]
