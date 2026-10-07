@@ -1,9 +1,10 @@
 import os
 import re
 import json
+import uuid
 import asyncio
 
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, quote
 
 from telegram import Update
 from telegram.ext import (
@@ -15,35 +16,22 @@ from telegram.ext import (
 )
 
 from google.cloud import run_v2
-from google.api_core.exceptions import GoogleAPICallError
+from google.api_core.exceptions import GoogleAPICallError, NotFound
 from google.oauth2 import service_account
 import google.auth
 
 
 TOKEN = os.getenv("BOT_TOKEN")
 
-DEFAULT_REGION = os.getenv(
-    "DEFAULT_REGION",
-    "us-central1"
-)
+DEFAULT_REGION = os.getenv("DEFAULT_REGION", "us-central1")
+SERVICE_NAME = os.getenv("SERVICE_NAME", "gc-run-service")
+CONTAINER_IMAGE = os.getenv("CONTAINER_IMAGE")
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
-SERVICE_NAME = os.getenv(
-    "SERVICE_NAME",
-    "gc-run-service"
-)
+WS_PATH = "/vless"
 
-CONTAINER_IMAGE = os.getenv(
-    "CONTAINER_IMAGE"
-)
 
-GOOGLE_CREDENTIALS_JSON = os.getenv(
-    "GOOGLE_CREDENTIALS_JSON"
-)
-
-URL_RE = re.compile(
-    r"https?://\S+",
-    re.I
-)
+URL_RE = re.compile(r"https?://\S+", re.I)
 
 
 # =========================================================
@@ -55,9 +43,7 @@ def get_google_credentials():
     if GOOGLE_CREDENTIALS_JSON:
 
         try:
-            info = json.loads(
-                GOOGLE_CREDENTIALS_JSON
-            )
+            info = json.loads(GOOGLE_CREDENTIALS_JSON)
 
             return service_account.Credentials.from_service_account_info(
                 info,
@@ -73,10 +59,13 @@ def get_google_credentials():
             )
 
     try:
+
         credentials, _ = google.auth.default()
+
         return credentials
 
     except Exception as exc:
+
         raise RuntimeError(
             "لم يتم العثور على Google Cloud credentials.\n"
             f"{type(exc).__name__}: {exc}"
@@ -143,11 +132,12 @@ def service_url(service: run_v2.Service) -> str:
     if service.uri:
         return service.uri
 
-    return "(لم يتم إرجاع رابط الخدمة)"
+    return ""
 
 
 async def deploy_cloud_run(
-    project_id: str
+    project_id: str,
+    vless_uuid: str,
 ) -> tuple[bool, str]:
 
     if not CONTAINER_IMAGE:
@@ -176,16 +166,22 @@ async def deploy_cloud_run(
         )
 
         container = run_v2.types.Container(
-            image=CONTAINER_IMAGE
+            image=CONTAINER_IMAGE,
+            env=[
+                run_v2.types.EnvVar(
+                    name="VLESS_UUID",
+                    value=vless_uuid,
+                ),
+                run_v2.types.EnvVar(
+                    name="WS_PATH",
+                    value=WS_PATH,
+                ),
+            ],
         )
 
         template = run_v2.types.RevisionTemplate(
             containers=[container]
         )
-
-        # لا نستخدم IngressTraffic هنا
-        # لأن النسخة الحالية من مكتبة google-cloud-run
-        # لا تحتوي عليه داخل Service
 
         service = run_v2.types.Service(
             name=name,
@@ -194,17 +190,15 @@ async def deploy_cloud_run(
 
         try:
 
-            existing = await client.get_service(
+            await client.get_service(
                 name=name
             )
-
-            service.name = existing.name
 
             operation = await client.update_service(
                 service=service
             )
 
-        except GoogleAPICallError:
+        except NotFound:
 
             operation = await client.create_service(
                 parent=parent,
@@ -214,9 +208,18 @@ async def deploy_cloud_run(
 
         result = await operation.result()
 
+        url = service_url(result)
+
+        if not url:
+
+            return (
+                False,
+                "تم إنشاء الخدمة ولكن لم يتم الحصول على رابط Cloud Run."
+            )
+
         return (
             True,
-            service_url(result)
+            url
         )
 
     except Exception as exc:
@@ -225,6 +228,41 @@ async def deploy_cloud_run(
             False,
             f"{type(exc).__name__}: {exc}"
         )
+
+
+# =========================================================
+# VLESS LINK
+# =========================================================
+
+def create_vless_link(
+    service_url_value: str,
+    vless_uuid: str,
+) -> str:
+
+    host = service_url_value
+
+    if host.startswith("https://"):
+        host = host[8:]
+
+    if host.startswith("http://"):
+        host = host[7:]
+
+    host = host.rstrip("/")
+
+    path = quote(
+        WS_PATH,
+        safe="/"
+    )
+
+    return (
+        f"vless://{vless_uuid}@{host}:443"
+        f"?encryption=none"
+        f"&security=tls"
+        f"&type=ws"
+        f"&host={host}"
+        f"&path={path}"
+        f"#GC.Run"
+    )
 
 
 # =========================================================
@@ -238,11 +276,9 @@ async def start(
 
     await update.message.reply_text(
         "👋 أهلاً بك في GC.Run\n\n"
-        "☁️ Google Cloud → Cloud Run\n\n"
-        "📎 أرسل رابط Google Cloud/Skills "
-        "الذي يحتوي على Project ID.\n\n"
-        "مثال:\n"
-        "https://www.cloudskillsboost.google/...\n\n"
+        "☁️ Google Cloud → Cloud Run\n"
+        "🔐 VLESS / WebSocket\n\n"
+        "📎 أرسل رابط المختبر أو Project ID.\n\n"
         "/help — طريقة الاستخدام\n"
         "/cancel — إلغاء العملية\n"
         "/status — حالة الإعداد"
@@ -261,10 +297,10 @@ async def help_cmd(
     await update.message.reply_text(
         "📖 طريقة الاستخدام:\n\n"
         "1️⃣ اضغط /start\n"
-        "2️⃣ أرسل رابط المختبر\n"
-        "3️⃣ البوت يستخرج Project ID\n"
-        "4️⃣ ينشئ أو يحدّث Cloud Run\n"
-        "5️⃣ يرسل رابط الخدمة\n\n"
+        "2️⃣ أرسل Project ID\n"
+        "3️⃣ البوت ينشئ UUID تلقائيًا\n"
+        "4️⃣ ينشئ/يحدّث Cloud Run\n"
+        "5️⃣ يرسل رابط VLESS\n\n"
         "⚠️ لا ترسل كلمات مرور Google "
         "أو رموز تسجيل الدخول."
     )
@@ -295,9 +331,7 @@ async def status(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    project = context.user_data.get(
-        "project_id"
-    )
+    project = context.user_data.get("project_id")
 
     if project:
 
@@ -336,7 +370,7 @@ async def handle_message(
 
         await update.message.reply_text(
             "❌ لم أجد Project ID.\n\n"
-            "أرسل رابط المختبر أو Project ID مباشرة."
+            "أرسل Project ID مباشرة."
         )
 
         return
@@ -344,17 +378,23 @@ async def handle_message(
     context.user_data["project_id"] = project_id
     context.user_data["cancelled"] = False
 
+    # إنشاء UUID جديد
+    vless_uuid = str(uuid.uuid4())
+
+    context.user_data["vless_uuid"] = vless_uuid
+
     progress = await update.message.reply_text(
         "☁️ GC.Run\n\n"
-        "✅ تم استلام الرابط.\n"
-        "🔎 جاري استخراج Project ID..."
+        "✅ تم استلام Project ID.\n"
+        "🔐 تم إنشاء UUID جديد.\n"
+        "🚀 جاري إنشاء Cloud Run..."
     )
 
     steps = [
-        "1️⃣ فتح الرابط...",
+        "1️⃣ التحقق من Project ID...",
         f"2️⃣ Project ID: {project_id}",
-        "3️⃣ التحقق من Cloud Run...",
-        "4️⃣ إنشاء/تحديث الخدمة...",
+        "3️⃣ إنشاء UUID لـ VLESS...",
+        "4️⃣ إنشاء/تحديث Cloud Run...",
     ]
 
     for index, step in enumerate(steps):
@@ -372,24 +412,33 @@ async def handle_message(
         )
 
     ok, result = await deploy_cloud_run(
-        project_id
+        project_id,
+        vless_uuid,
     )
 
-    if ok:
-
-        await progress.edit_text(
-            "🎉 تم النشر بنجاح!\n\n"
-            "🔗 الرابط:\n"
-            f"{result}\n\n"
-            "✅ Cloud Run يعمل."
-        )
-
-    else:
+    if not ok:
 
         await progress.edit_text(
             "❌ فشل النشر.\n\n"
             f"السبب:\n{result}"
         )
+
+        return
+
+    vless_link = create_vless_link(
+        result,
+        vless_uuid,
+    )
+
+    await progress.edit_text(
+        "🎉 تم إنشاء الخدمة!\n\n"
+        f"☁️ Cloud Run:\n{result}\n\n"
+        "🔐 VLESS:\n"
+        f"`{vless_link}`\n\n"
+        "✅ تم إنشاء UUID تلقائيًا."
+        ,
+        parse_mode="Markdown",
+    )
 
 
 # =========================================================
@@ -399,6 +448,7 @@ async def handle_message(
 def main():
 
     if not TOKEN:
+
         raise RuntimeError(
             "BOT_TOKEN غير مضبوط في Blitz."
         )
