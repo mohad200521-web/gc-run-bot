@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: gc-run-bot
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
